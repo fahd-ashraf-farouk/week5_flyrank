@@ -29,10 +29,50 @@ RATING_MAP = {
 }
 
 MAX_RETRIES = 3
-INITIAL_BACKOFF = 1.0  # بالثواني
+INITIAL_BACKOFF = 1.0
 
 # ---------------------------------------------------------
-# 2. Pydantic Schema
+# 2. Run Report Tracker
+# ---------------------------------------------------------
+class RunReport:
+    def __init__(self):
+        self.start_time = time.time()
+        self.pages_discovered = 0
+        self.pages_scraped = 0
+        self.pages_cached = 0
+        self.pages_network = 0
+        self.pages_failed = 0
+        self.records_extracted = 0
+        self.records_saved = 0
+
+    def to_dict(self) -> dict:
+        duration = round(time.time() - self.start_time, 2)
+        status = "SUCCESS" if self.pages_failed == 0 else "PARTIAL_SUCCESS"
+        if self.records_saved == 0:
+            status = "FAILED"
+
+        return {
+            "run_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "duration_seconds": duration,
+            "pages_discovered": self.pages_discovered,
+            "pages_scraped": self.pages_scraped,
+            "pages_cached": self.pages_cached,
+            "pages_network": self.pages_network,
+            "pages_failed": self.pages_failed,
+            "records_extracted": self.records_extracted,
+            "records_saved": self.records_saved,
+            "status": status
+        }
+
+    def save(self):
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        report_path = os.path.join(OUTPUT_DIR, "run-report.json")
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
+        print(f"Report saved to {report_path}")
+
+# ---------------------------------------------------------
+# 3. Pydantic Schema
 # ---------------------------------------------------------
 class BookSchema(BaseModel):
     title: str
@@ -46,69 +86,62 @@ class BookSchema(BaseModel):
     fetched_at: str
 
 # ---------------------------------------------------------
-# 3. Robust Fetching with Retry Logic & Exponential Backoff
+# 4. Fetch Function with Tracking
 # ---------------------------------------------------------
-def fetch_page_with_retry(url: str, cache_filename: str) -> str:
-    """
-    تحميل الصفحة مع دعم الـ Cache، وإعادة المحاولة عند الأخطاء المؤقتة (Exponential Backoff).
-    """
+def fetch_page_with_retry(url: str, cache_filename: str, report: RunReport) -> str:
     os.makedirs(CACHE_DIR, exist_ok=True)
     cache_path = os.path.join(CACHE_DIR, cache_filename)
 
-    # 1. فحص الـ Cache أولاً
+    # Cache Hit
     if os.path.exists(cache_path):
+        report.pages_cached += 1
         with open(cache_path, "r", encoding="utf-8") as f:
             return f.read()
 
-    # 2. محاولة جلب الصفحة عبر الشبكة مع الـ Retry Logic
+    # Network Fetch
+    report.pages_network += 1
     attempt = 0
     while attempt < MAX_RETRIES:
         attempt += 1
-        time.sleep(0.5)  # Politeness Delay
+        time.sleep(0.5)
 
         try:
             response = requests.get(url, headers=HEADERS, timeout=10)
 
-            # حالة النجاح
             if response.status_code == 200:
                 html_content = response.text
                 with open(cache_path, "w", encoding="utf-8") as f:
                     f.write(html_content)
                 return html_content
 
-            # أخطاء لا تتطلب إعادة المحاولة (مثل 404)
             if response.status_code in [404, 410]:
                 raise Exception(f"Permanent HTTP error {response.status_code} for {url}")
 
-            # فحص الـ Retry-After Header (إذا أرسله السيرفر عند 429 أو 503)
             retry_after = response.headers.get("Retry-After")
             if retry_after and retry_after.isdigit():
                 sleep_time = float(retry_after)
-                print(f"[WARN] Server requested Retry-After {sleep_time}s for {url}")
             else:
-                # Exponential backoff مع Jitter عشوائي
                 jitter = random.uniform(0.1, 0.5)
                 sleep_time = (INITIAL_BACKOFF * (2 ** (attempt - 1))) + jitter
 
-            print(f"[RETRY {attempt}/{MAX_RETRIES}] HTTP {response.status_code} for {url}. Waiting {sleep_time:.2f}s...")
             time.sleep(sleep_time)
 
         except (requests.exceptions.RequestException, Exception) as e:
             if "Permanent HTTP error" in str(e) or attempt == MAX_RETRIES:
-                print(f"[ERROR] Failed to fetch {url} after {attempt} attempts. Reason: {e}")
+                report.pages_failed += 1
                 raise e
             
             jitter = random.uniform(0.1, 0.5)
             sleep_time = (INITIAL_BACKOFF * (2 ** (attempt - 1))) + jitter
-            print(f"[RETRY {attempt}/{MAX_RETRIES}] Exception for {url}: {e}. Waiting {sleep_time:.2f}s...")
             time.sleep(sleep_time)
 
+    report.pages_failed += 1
     raise Exception(f"Failed to fetch {url} after {MAX_RETRIES} attempts.")
 
 # ---------------------------------------------------------
-# 4. Processing & Validation
+# 5. Pipeline Stages
 # ---------------------------------------------------------
-def discover_books(max_pages: int = 3) -> list:
+def discover_books(report: RunReport, max_pages: int = 3) -> list:
     current_url = BASE_URL
     discovered_items = []
     pages_crawled = 0
@@ -118,7 +151,7 @@ def discover_books(max_pages: int = 3) -> list:
         cache_file = f"catalogue-page-{pages_crawled}.html"
         
         try:
-            html = fetch_page_with_retry(current_url, cache_file)
+            html = fetch_page_with_retry(current_url, cache_file, report)
             soup = BeautifulSoup(html, "html.parser")
 
             articles = soup.find_all("article", class_="product_pod")
@@ -137,9 +170,10 @@ def discover_books(max_pages: int = 3) -> list:
             else:
                 current_url = None
         except Exception as e:
-            print(f"[ERROR] Failed discovering page {current_url}: {e}")
+            print(f"[ERROR] Failed discovering catalogue page {current_url}: {e}")
             break
 
+    report.pages_discovered = len(discovered_items)
     return discovered_items
 
 def normalize_and_validate(raw_data: dict) -> BookSchema:
@@ -165,9 +199,8 @@ def normalize_and_validate(raw_data: dict) -> BookSchema:
         fetched_at=raw_data["fetched_at"]
     )
 
-def process_all_books(items: list) -> tuple[list, int]:
+def process_all_books(items: list, report: RunReport) -> list:
     validated_books = []
-    failed_count = 0
 
     for index, item in enumerate(items, start=1):
         product_url = item["product_url"]
@@ -176,9 +209,10 @@ def process_all_books(items: list) -> tuple[list, int]:
         cache_file = f"book-{index}-{slug}.html"
 
         try:
-            html = fetch_page_with_retry(product_url, cache_file)
-            soup = BeautifulSoup(html, "html.parser")
+            html = fetch_page_with_retry(product_url, cache_file, report)
+            report.pages_scraped += 1
 
+            soup = BeautifulSoup(html, "html.parser")
             product_main = soup.find("div", class_="product_main")
             
             title = product_main.h1.text.strip() if product_main and product_main.h1 else ""
@@ -211,15 +245,16 @@ def process_all_books(items: list) -> tuple[list, int]:
                 "fetched_at": fetched_at
             }
 
+            report.records_extracted += 1
+
             validated_book = normalize_and_validate(raw_data)
             validated_books.append(validated_book.model_dump(mode="json"))
+            report.records_saved += 1
 
         except Exception as e:
-            # عزل الخطأ حتى لا يتوقف البرنامج
-            failed_count += 1
-            print(f"[SKIP] Failed processing book at {product_url}: {e}")
+            print(f"[SKIP] Error processing book at {product_url}: {e}")
 
-    return validated_books, failed_count
+    return validated_books
 
 def save_output(data: list):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -228,19 +263,18 @@ def save_output(data: list):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 # ---------------------------------------------------------
-# 5. Main Execution
+# 6. Main Execution
 # ---------------------------------------------------------
 if __name__ == "__main__":
-    print("Discovering books with retry handling...")
-    items = discover_books(max_pages=3)
-    
-    print(f"Processing {len(items)} books...")
-    books_data, failed_count = process_all_books(items)
+    report = RunReport()
+
+    print("Running scraper pipeline...")
+    items = discover_books(report, max_pages=3)
+    books_data = process_all_books(items, report)
 
     save_output(books_data)
+    report.save()
 
-    # Stage 5 Checkpoint Output
-    print("\n--- STAGE 5 CHECKPOINT ---")
-    print(f"total_discovered = {len(items)}")
-    print(f"successfully_processed = {len(books_data)}")
-    print(f"failed_records = {failed_count}")
+    # Stage 6 Checkpoint Output
+    print("\n--- STAGE 6 CHECKPOINT ---")
+    print(json.dumps(report.to_dict(), indent=2))
