@@ -1,5 +1,6 @@
 import os
 import time
+from datetime import datetime, timezone
 from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
@@ -11,27 +12,20 @@ HEADERS = {
 }
 
 def fetch_page(url: str, cache_filename: str) -> str:
-    """
-    تحميل الصفحة أو قراءتها من الـ Cache إذا كانت محفوظة.
-    تطبيق delay فقط إذا تم إرسال طلب حقيقي للشبكة.
-    """
+
     os.makedirs(CACHE_DIR, exist_ok=True)
     cache_path = os.path.join(CACHE_DIR, cache_filename)
 
     if os.path.exists(cache_path):
         with open(cache_path, "r", encoding="utf-8") as f:
             html_content = f.read()
-        print(f"CACHE HIT | {cache_filename}")
         return html_content
 
-    # أدب السكرايبر: انتظار نصف ثانية قبل أي طلب حقيقي 
     time.sleep(0.5)
 
-    print(f"FETCH | URL: {url}")
     response = requests.get(url, headers=HEADERS, timeout=10)
-    
     if response.status_code != 200:
-        raise Exception(f"Failed to fetch {url}, status: {response.status_code}")
+        raise Exception(f"Failed to fetch {url}, status code: {response.status_code}")
 
     html_content = response.text
     with open(cache_path, "w", encoding="utf-8") as f:
@@ -40,30 +34,26 @@ def fetch_page(url: str, cache_filename: str) -> str:
     return html_content
 
 def discover_books(max_pages: int = 3):
-    """
-    المرور على صفحات الكتالوج وتجميع روابط الـ 60 كتاب
-    """
     current_url = BASE_URL
-    book_urls = []
+    discovered_items = []
     pages_crawled = 0
 
     while current_url and pages_crawled < max_pages:
         pages_crawled += 1
         cache_file = f"catalogue-page-{pages_crawled}.html"
         
-        # 1. جلب محتوى الصفحة
         html = fetch_page(current_url, cache_file)
         soup = BeautifulSoup(html, "html.parser")
 
-        # 2. استخراج روابط الكتب داخل الصفحة
         articles = soup.find_all("article", class_="product_pod")
         for article in articles:
             rel_link = article.h3.a["href"]
-            # تحويل الرابط النسبي إلى مطلق باستخدام urljoin [cite: 85]
             abs_link = urljoin(current_url, rel_link)
-            book_urls.append(abs_link)
+            discovered_items.append({
+                "product_url": abs_link,
+                "source_page": current_url
+            })
 
-        # 3. العثور على رابط الصفحة التالية (Next link) 
         next_button = soup.find("li", class_="next")
         if next_button and next_button.a:
             next_rel_link = next_button.a["href"]
@@ -71,16 +61,66 @@ def discover_books(max_pages: int = 3):
         else:
             current_url = None
 
-    # إزالة التكرار
-    unique_book_urls = list(dict.fromkeys(book_urls))
+    return discovered_items
 
-    # طباعة نتائج الـ Checkpoint الرسمية 
-    print("\n--- STAGE 2 CHECKPOINT ---")
-    print(f"catalogue_pages = {pages_crawled}")
-    print(f"discovered = {len(book_urls)}")
-    print(f"unique_urls = {len(unique_book_urls)}")
+def extract_book_details(items: list) -> list:
+    raw_records = []
 
-    return unique_book_urls
+    for index, item in enumerate(items, start=1):
+        product_url = item["product_url"]
+        source_page = item["source_page"]
+        
+        slug = product_url.split("/")[-2]
+        cache_file = f"book-{index}-{slug}.html"
+
+        html = fetch_page(product_url, cache_file)
+        soup = BeautifulSoup(html, "html.parser")
+
+        product_main = soup.find("div", class_="product_main")
+        
+        title = product_main.h1.text.strip() if product_main and product_main.h1 else ""
+        price_text = product_main.find("p", class_="price_color").text.strip() if product_main.find("p", class_="price_color") else ""
+        availability_text = product_main.find("p", class_="instock availability").text.strip() if product_main.find("p", class_="instock availability") else ""
+        
+        rating_p = product_main.find("p", class_="star-rating")
+        rating_text = ""
+        if rating_p:
+            classes = rating_p.get("class", [])
+            rating_text = [c for c in classes if c != "star-rating"][0] if len(classes) > 1 else ""
+
+        description = None
+        product_desc_div = soup.find("div", id="product_description")
+        if product_desc_div:
+            desc_p = product_desc_div.find_next_sibling("p")
+            if desc_p:
+                description = desc_p.text.strip()
+
+        fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        raw_record = {
+            "title": title,
+            "product_url": product_url,
+            "price_text": price_text,
+            "availability_text": availability_text,
+            "rating_text": rating_text,
+            "description": description,
+            "source_page": source_page,
+            "fetched_at": fetched_at
+        }
+        
+        raw_records.append(raw_record)
+
+    return raw_records
 
 if __name__ == "__main__":
-    discover_books(max_pages=3)
+    print("Discovering book links...")
+    items = discover_books(max_pages=3)
+    
+    print(f"Extracting details for {len(items)} books...")
+    raw_records = extract_book_details(items)
+
+    print("\n--- STAGE 3 CHECKPOINT ---")
+    print(f"detail_pages = {len(raw_records)}")
+    print("\nSample Raw Record:")
+    import json
+    print(json.dumps(raw_records[0], indent=2))
